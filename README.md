@@ -26,7 +26,7 @@ tg交流群 https://t.me/+ft-zI76oovgwNmRh
 
 ### 方法 1: 使用预编译版本（推荐）
 
-从 [GitHub Releases](https://github.com/your-repo/releases) 下载对应平台的压缩包：
+从 [GitHub Releases](https://github.com/byJoey/ech-wk/releases) 下载对应平台的压缩包：
 
 - **Windows**: `ECHWorkers-windows-amd64.zip`
 - **macOS Intel**: `ECHWorkers-darwin-amd64.zip`
@@ -37,7 +37,6 @@ tg交流群 https://t.me/+ft-zI76oovgwNmRh
 解压后直接运行：
 - **Windows**: 双击 `ECHWorkersGUI.exe` 启动 GUI，或运行 `ech-workers.exe` 使用命令行
 - **macOS**: 运行 `./ECHWorkersGUI` 启动 GUI，或运行 `./ech-workers` 使用命令行
-- **Linux**: 运行 `./ECHWorkersGUI` 启动 GUI，或运行 `./ech-workers` 使用命令行
 
 > **注意**: 预编译版本已包含所有依赖，无需安装 Python 或任何其他软件。
 
