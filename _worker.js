@@ -1,6 +1,6 @@
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
-const CF_FALLBACK_IPS = ['sjc.o00o.ooo'];
+const CF_FALLBACK_IPS = ['150.230.63.93','193.122.114.82','sjc.o00o.ooo'];
 
 // 复用 TextEncoder，避免重复创建
 const encoder = new TextEncoder();
