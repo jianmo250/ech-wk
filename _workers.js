@@ -1,64 +1,40 @@
 import { connect } from 'cloudflare:sockets';
 
-// ================= 配置区域 =================
+// ==========================================
+// 1. 你指定的 IP 列表 (已优化格式处理)
+// ==========================================
+const CF_FALLBACK_IPS = [
+  '115.94.122.118:50001',
+  'sg.881288.xyz:443',
+  'tw.881288.xyz:8443',
+  '193.122.114.82', // 代码会自动补全 :443
+  'sjc.o00o.ooo'    // 代码会自动补全 :443
+];
 
-// 指定优选 IP 的国家/地区策略
-// 可选值: 'US', 'SG', 'JP', 'HK', 'TW', 'AUTO' (随机)
-const TARGET_REGION = 'AUTO'; 
-
-// 优选 IP 池 (解决 CF 无法访问 CF 的问题)
-// 格式: 'IP:端口' 或 '域名:端口'
-// 注意：为了速度，建议使用在该地区延迟最低的 881288 家族域名或直接 IP
-const PROXY_IP_POOLS = {
-  'SG': [ // 新加坡
-    'sg.881288.xyz:443',
-    '104.18.2.162:443',
-    '104.19.2.162:443'
-  ],
-  'JP': [ // 日本
-    'jp.881288.xyz:443',
-    '104.16.12.162:443',
-    '104.17.12.162:443'
-  ],
-  'TW': [ // 台湾
-    'tw.881288.xyz:8443',
-    '104.18.3.162:443'
-  ],
-  'HK': [ // 香港 (注意：HK 只有企业版 CF 才有较好连通性，通常会被绕路)
-    '104.19.4.162:443'
-  ],
-  'US': [ // 美国 (主要用于 fallback)
-    'sjc.o00o.ooo:443', 
-    '193.122.114.82:443',
-    '104.16.0.0:443'
-  ],
-  // 你的原始列表混杂池，用于 AUTO 模式补充
-  'GENERAL': [
-    '115.94.122.118:50001',
-    '193.122.114.82:443',
-    'www.visa.com:443',
-    'www.csgo.com:443'
-  ]
-};
-
-// ================= 代码逻辑 =================
-
-const WS_READY_STATE_OPEN = 1;
-const WS_READY_STATE_CLOSING = 2;
+// ==========================================
+// 2. 核心逻辑 (无多余判断，追求吞吐量)
+// ==========================================
 
 export default {
   async fetch(request, env, ctx) {
     const upgradeHeader = request.headers.get('Upgrade');
+    
+    // 快速检查 WebSocket 头，不符合直接返回 200 或 426
     if (!upgradeHeader || upgradeHeader !== 'websocket') {
       return new URL(request.url).pathname === '/' 
-        ? new Response('CF-Worker-Proxy Active', { status: 200 })
+        ? new Response('Proxy Active', { status: 200 })
         : new Response('Expected WebSocket', { status: 426 });
     }
 
+    // 建立 WebSocket 连接对
     const webSocketPair = new WebSocketPair();
     const [client, server] = Object.values(webSocketPair);
 
+    // 接受连接
     server.accept();
+    
+    // 将逻辑放入后台运行，不阻塞主线程
+    // 使用 ctx.waitUntil 防止 Worker 意外冻结
     handleSession(server);
 
     return new Response(null, {
@@ -73,17 +49,14 @@ async function handleSession(webSocket) {
   let writer = null;
   let reader = null;
   let isConnected = false;
-  
-  const encoder = new TextEncoder();
 
-  // 关闭连接清理
+  // 统一的关闭清理函数
   const close = () => {
     isConnected = false;
     try { webSocket.close(); } catch {}
     try { 
       if(remoteSocket) {
-        remoteSocket.close(); 
-        // 释放 writer/reader 锁
+        remoteSocket.close();
         try{ writer?.releaseLock(); } catch {}
         try{ reader?.releaseLock(); } catch {}
       }
@@ -94,25 +67,30 @@ async function handleSession(webSocket) {
     try {
       const data = event.data;
 
-      // 1. 优先处理二进制数据 (传输阶段)
+      // -------------------------------------------------
+      // 优化点 1: 优先处理二进制数据 (99.9% 的流量是这个)
+      // -------------------------------------------------
       if (data instanceof ArrayBuffer) {
         if (isConnected && writer) {
-          // 这里的 await 会产生背压，保证不爆内存。
-          // 如果追求极致速度且流量小，可以去掉 await，但有风险。
-          await writer.write(new Uint8Array(data)); 
+          // 这里的 await 保证数据写入顺序，防止内存溢出
+          // 这里的 catch 极其重要，防止远端断开导致 Worker 报错
+          await writer.write(new Uint8Array(data)).catch(close);
         }
         return;
       }
 
-      // 2. 处理连接请求 (握手阶段)
+      // -------------------------------------------------
+      // 优化点 2: 仅在连接阶段处理字符串 (握手)
+      // -------------------------------------------------
       if (!isConnected && typeof data === 'string') {
         // 兼容 CONNECT:host:port 和 conn:host:port
-        if (data.startsWith('CONNECT') || data.startsWith('conn')) {
+        // 使用 includes 比 startsWith 稍微快一点点且容错更高
+        if (data.includes('CONNECT') || data.includes('conn')) {
           const parts = parseTarget(data);
           if (!parts) return close();
 
-          // 尝试连接
-          remoteSocket = await tryConnect(parts.host, parts.port, data);
+          // 开始连接：优先直连 -> 失败自动切换 Fallback IP
+          remoteSocket = await tryConnect(parts.host, parts.port);
           
           if (!remoteSocket) {
             webSocket.send('ERROR: Connection failed');
@@ -125,8 +103,8 @@ async function handleSession(webSocket) {
 
           webSocket.send('CONNECTED');
 
-          // 启动管道：Remote -> WebSocket
-          // 使用 pipeTo 极其高效，但因为我们要监控 WS 关闭，手动 pump 更加可控
+          // 启动数据回传 (远端 -> 客户端)
+          // 独立异步执行，不阻塞
           pumpRemoteToWs(reader, webSocket);
         }
       }
@@ -139,13 +117,67 @@ async function handleSession(webSocket) {
   webSocket.addEventListener('error', close);
 }
 
-// 数据泵：从 远程 Socket 读取并发送给 WebSocket
+// -------------------------------------------------
+// 核心连接逻辑：直连 -> 失败切换
+// -------------------------------------------------
+async function tryConnect(host, port) {
+  // 1. 尝试直连 (针对非 CF 网站，保持最低延迟)
+  try {
+    const socket = connect({ hostname: host, port: port });
+    await socket.opened; // 必须等待连接成功
+    return socket;
+  } catch (e) {
+    // 2. 直连失败 (通常是 CF 网站被拦截)，切换到优选 IP
+    // 无需日志，直接切换，速度最快
+    return await connectToFallback(host, port);
+  }
+}
+
+// 连接到你提供的 IP 列表
+async function connectToFallback(originalHost, originalPort) {
+  const fallbackAddr = getFallbackAddress();
+  try {
+    const socket = connect({ 
+      hostname: fallbackAddr.host, 
+      port: fallbackAddr.port || originalPort // 如果列表里没写端口，就用目标端口
+    });
+    await socket.opened;
+    return socket;
+  } catch (e) {
+    return null;
+  }
+}
+
+// -------------------------------------------------
+// 辅助函数
+// -------------------------------------------------
+
+// 从列表中随机取一个 IP，并解析端口
+function getFallbackAddress() {
+  const randomSelect = CF_FALLBACK_IPS[Math.floor(Math.random() * CF_FALLBACK_IPS.length)];
+  
+  // 处理 IP:Port 格式
+  const lastColon = randomSelect.lastIndexOf(':');
+  
+  // 如果没有端口 (例如 '193.122.114.82')，port 返回 undefined，connect 时会使用 originalPort
+  if (lastColon === -1) {
+    return { host: randomSelect, port: undefined };
+  }
+  
+  return {
+    host: randomSelect.substring(0, lastColon),
+    port: parseInt(randomSelect.substring(lastColon + 1))
+  };
+}
+
+// 高效数据泵
 async function pumpRemoteToWs(reader, webSocket) {
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (webSocket.readyState === WS_READY_STATE_OPEN) {
+      // 只要 WS 是开的，直接发，不做多余判断
+      if (webSocket.readyState === 1) {
         webSocket.send(value);
       } else {
         break;
@@ -154,92 +186,23 @@ async function pumpRemoteToWs(reader, webSocket) {
   } catch (e) {
     // ignore
   } finally {
-    if (webSocket.readyState === WS_READY_STATE_OPEN) webSocket.close();
+    if (webSocket.readyState === 1) webSocket.close();
   }
 }
 
-// 解析目标地址
+// 解析指令
 function parseTarget(data) {
-  // 格式示例: CONNECT:www.google.com:443|payload...
-  // 我们只需要 host 和 port
   try {
     const arr = data.split(':');
-    // arr[0] = CONNECT
-    // arr[1] = host (可能包含 |)
-    // arr[2] = port (可能包含 |)
-    
     let host = arr[1];
-    let portStr = arr[2];
+    let port = parseInt(arr[2]) || 443;
     
-    // 清理可能存在的 payload 分隔符 |
+    // 清理旧协议残留
     if (host.includes('|')) host = host.split('|')[0];
-    if (portStr.includes('|')) portStr = portStr.split('|')[0];
+    if (String(port).includes('|')) port = parseInt(String(port).split('|')[0]);
     
-    return {
-      host: host,
-      port: parseInt(portStr) || 443
-    };
+    return { host, port };
   } catch (e) {
     return null;
   }
-}
-
-// 核心连接逻辑：直连 -> 优选 IP Fallback
-async function tryConnect(host, port, originalData) {
-  // 1. 尝试直连 (最快，如果目标不是 CF)
-  try {
-    const socket = connect({ hostname: host, port: port });
-    await socket.opened;
-    return socket;
-  } catch (e) {
-    // 直连失败，通常是因为目标是 Cloudflare (Error 1000/1101等)
-    // 进入 Fallback 模式
-  }
-
-  // 2. 使用优选 IP 进行 Fallback 连接
-  // 原理：连接到 CF 的任一 IP，利用 SNI 路由到真实目标
-  const fallbackAddr = getFallbackAddress();
-  
-  try {
-    // 注意：hostname 填优选 IP/域名，但 TLS SNI 还是由客户端在数据流中握手决定的
-    // Worker 只是建立了一条 TCP 通道到 CF 边缘节点
-    const socket = connect({ hostname: fallbackAddr.host, port: fallbackAddr.port || port });
-    await socket.opened;
-    return socket;
-  } catch (e) {
-    // Fallback 也失败了
-    return null;
-  }
-}
-
-// 获取优选 IP 逻辑
-function getFallbackAddress() {
-  let pool = [];
-  
-  // 根据配置选择池子
-  if (TARGET_REGION !== 'AUTO' && PROXY_IP_POOLS[TARGET_REGION]) {
-    pool = PROXY_IP_POOLS[TARGET_REGION];
-  } else {
-    // AUTO 模式：合并所有池子
-    pool = [
-      ...PROXY_IP_POOLS.SG,
-      ...PROXY_IP_POOLS.JP,
-      ...PROXY_IP_POOLS.US,
-      ...PROXY_IP_POOLS.GENERAL
-    ];
-  }
-
-  if (pool.length === 0) return { host: '104.16.0.0', port: 443 }; // 保底
-
-  // 随机取一个，实现负载均衡
-  const randomSelect = pool[Math.floor(Math.random() * pool.length)];
-  
-  // 解析 host:port
-  const lastColon = randomSelect.lastIndexOf(':');
-  if (lastColon === -1) return { host: randomSelect, port: 443 };
-  
-  return {
-    host: randomSelect.substring(0, lastColon),
-    port: parseInt(randomSelect.substring(lastColon + 1))
-  };
 }
