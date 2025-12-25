@@ -5,15 +5,20 @@ import { connect } from 'cloudflare:sockets';
 // ==========================================
 // 优选 IP 列表 (用于竞速连接)
 const CF_FALLBACK_IPS = [
+  'tw.881288.xyz:443',
+  '222.109.29.179:50001',
+  '114.32.9.249:16443',
+  '60.248.139.106:11017',
+  '220.128.110.108:43',
+  '60.251.232.240:995',
   '115.94.122.118:50001',
   'sg.881288.xyz:443',
-  'tw.881288.xyz:8443',
-  '193.122.114.82:443',
-  'sjc.o00o.ooo:443'
+  'sjc.o00o.ooo:443',
+  '193.122.114.82:443'
 ];
 
 // 鉴权 Token (留空则不验证)
-const TOKEN = ''; 
+const TOKEN = '1'; 
 
 export default {
   async fetch(request, env, ctx) {
@@ -23,8 +28,8 @@ export default {
       // 1. 基础检查：是否为 WebSocket 请求
       if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
         return new URL(request.url).pathname === '/' 
-          ? new Response('Latency Optimization Worker Active', { status: 200 })
-          : new Response('Expected WebSocket', { status: 426 });
+          ? new Response('', { status: 400 })
+          : new Response('', { status: 426 });
       }
 
       // 2. 鉴权逻辑：检查 Sec-WebSocket-Protocol
