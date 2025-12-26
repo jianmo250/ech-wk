@@ -64,7 +64,7 @@ type ipRangeV6 struct {
 func init() {
 	flag.StringVar(&listenAddr, "l", "127.0.0.1:30000", "代理监听地址 (支持 SOCKS5 和 HTTP)")
 	flag.StringVar(&serverAddr, "f", "", "服务端地址 (格式: x.x.workers.dev:443)")
-	flag.StringVar(&serverIP, "ip", "", "指定服务端 IP（绕过 DNS 解析）")
+	flag.StringVar(&serverIP, "ip", "", "指定服务端 IP（支持 IP 或 IP:Port，绕过 DNS 解析）")
 	flag.StringVar(&token, "token", "", "身份验证令牌")
 	flag.StringVar(&dnsServer, "dns", "dns.alidns.com/dns-query", "ECH 查询 DoH 服务器")
 	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH 查询域名")
@@ -743,14 +743,17 @@ func queryDoHForProxy(dnsQuery []byte) ([]byte, error) {
 	// 如果指定了 IP，使用自定义 Dialer
 	if serverIP != "" {
 		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// [修改] 如果 serverIP 已经包含端口（如 1.2.3.4:8080），直接使用
+			if _, _, err := net.SplitHostPort(serverIP); err == nil {
+				return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, serverIP)
+			}
+
+			// 否则从 addr (cloudflare-dns.com:443) 获取端口，拼接到 serverIP
 			_, port, err := net.SplitHostPort(addr)
 			if err != nil {
 				return nil, err
 			}
-			dialer := &net.Dialer{
-				Timeout: 10 * time.Second,
-			}
-			return dialer.DialContext(ctx, network, net.JoinHostPort(serverIP, port))
+			return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, net.JoinHostPort(serverIP, port))
 		}
 	}
 
@@ -835,6 +838,12 @@ func dialWebSocketWithECH(maxRetries int) (*websocket.Conn, error) {
 
 		if serverIP != "" {
 			dialer.NetDial = func(network, address string) (net.Conn, error) {
+				// [修改] 如果 serverIP 已经包含端口（如 1.2.3.4:8080），直接使用
+				if _, _, err := net.SplitHostPort(serverIP); err == nil {
+					return net.DialTimeout(network, serverIP, 10*time.Second)
+				}
+
+				// 否则从 websocket url 地址 (host:port) 获取端口
 				_, port, err := net.SplitHostPort(address)
 				if err != nil {
 					return nil, err
